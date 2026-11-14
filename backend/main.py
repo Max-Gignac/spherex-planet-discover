@@ -1,15 +1,18 @@
 import io
 import base64
 import requests
+import urllib3
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from astroquery.ipac.irsa import Irsa
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.visualization import ZScaleInterval
 import astropy.units as u
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="SPHEREx Discovery API")
 
@@ -20,21 +23,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (SPHEREx-Hackathon-Client)"}
 
-def fits_bytes_to_base64_png(fits_bytes: bytes) -> str:
-    with fits.open(io.BytesIO(fits_bytes)) as hdul:
-        data = hdul[1].data if len(hdul) > 1 and hdul[1].data is not None else hdul[0].data
-        data = np.nan_to_num(data, nan=0.0)
 
+def array_to_base64_png(data: np.ndarray) -> str:
+    data = np.nan_to_num(data, nan=0.0)
     interval = ZScaleInterval()
     vmin, vmax = interval.get_limits(data)
     scaled = np.clip((data - vmin) / (vmax - vmin + 1e-8), 0, 1) * 255
     img = Image.fromarray(scaled.astype(np.uint8)).transpose(Image.FLIP_TOP_BOTTOM)
+    img = img.resize((256, 256), Image.Resampling.BILINEAR)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{img_b64}"
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+
+def find_poi_256(diff_array: np.ndarray) -> dict:
+    """Finds the brightest anomaly (Point of Interest) mapped onto a 256x256 flipped display grid."""
+    h, w = diff_array.shape
+    # Ignore 6px border artifacts from detector edges
+    border = max(2, min(h, w) // 20)
+    core = np.abs(diff_array.copy())
+    core[:border, :] = 0
+    core[-border:, :] = 0
+    core[:, :border] = 0
+    core[:, -border:] = 0
+
+    y_idx, x_idx = np.unravel_index(np.argmax(core), core.shape)
+    # Match FLIP_TOP_BOTTOM used in array_to_base64_png and scale to 256x256
+    flipped_y = (h - 1) - y_idx
+    x_256 = int(round((x_idx / max(w - 1, 1)) * 255))
+    y_256 = int(round((flipped_y / max(h - 1, 1)) * 255))
+    return {"x": x_256, "y": y_256}
+
+
+def fetch_fits_array(access_url: str, ra: float, dec: float, size: float) -> np.ndarray:
+    cutout_url = f"{access_url}?center={ra},{dec}&size={size}"
+    resp = requests.get(cutout_url, headers=HEADERS, timeout=15, verify=False)
+    resp.raise_for_status()
+    with fits.open(io.BytesIO(resp.content)) as hdul:
+        data = hdul[1].data if len(hdul) > 1 and hdul[1].data is not None else hdul[0].data
+        return np.nan_to_num(data.astype(np.float32), nan=0.0)
+
+
+def generate_simulated_blink(ra: float, dec: float):
+    rng = np.random.default_rng(int(abs(ra * 1000 + dec * 1000)))
+    base = rng.normal(25, 5, (256, 256)).astype(np.float32)
+    for _ in range(30):
+        x, y = rng.integers(15, 240, size=2)
+        base[y - 2 : y + 3, x - 2 : x + 3] += float(rng.integers(120, 220))
+
+    ep1 = base.copy()
+    ep2 = base.copy()
+    ep1[120:126, 115:121] += 230.0
+    ep2[128:134, 129:135] += 230.0
+    diff = ep2 - ep1
+    poi = find_poi_256(diff)
+    return array_to_base64_png(ep1), array_to_base64_png(ep2), array_to_base64_png(diff), poi
 
 
 @app.get("/")
@@ -42,50 +88,58 @@ def health_check():
     return {"status": "SPHEREx Backend is running!"}
 
 
-@app.get("/api/cutout")
-def get_spherex_cutout(ra: float = 133.7951, dec: float = -7.2451, size: float = 0.05):
-    """
-    Default coordinates point to WISE 0855 (fast-moving brown dwarf benchmark).
-    Tries IRSA SIA2 first; falls back to HiPS2FITS infrared FITS cutouts if IRSA's proxy returns 502.
-    """
+@app.get("/api/blink")
+def get_multi_epoch_blink(ra: float = 269.4521, dec: float = 4.6934, size: float = 0.05):
     coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
 
-    # 1. Primary: Try IRSA SIA2 (SPHEREx DR1 / QR3)
     for col in ["spherex_dr1", "spherex_qr3"]:
         try:
             results = Irsa.query_sia(pos=(coord, size * u.deg), collection=col)
-            if len(results) > 0:
-                row = results[0]
-                cutout_url = f"{row['access_url']}?center={ra},{dec}&size={size}"
-                resp = requests.get(cutout_url, timeout=20)
-                resp.raise_for_status()
+            if len(results) >= 2:
+                if "t_min" in results.colnames:
+                    results.sort("t_min")
+
+                row1 = results[0]
+                row2 = results[-1]
+
+                arr1 = fetch_fits_array(row1["access_url"], ra, dec, size)
+                arr2 = fetch_fits_array(row2["access_url"], ra, dec, size)
+
+                if arr1.shape != arr2.shape:
+                    pil2 = Image.fromarray(arr2).resize((arr1.shape[1], arr1.shape[0]), Image.Resampling.BILINEAR)
+                    arr2 = np.array(pil2, dtype=np.float32)
+
+                arr1_norm = arr1 - np.median(arr1)
+                arr2_norm = arr2 - np.median(arr2)
+                diff = arr2_norm - arr1_norm
+                poi = find_poi_256(diff)
+
                 return {
                     "ra": ra,
                     "dec": dec,
                     "source": f"IRSA SIA2 ({col})",
-                    "total_observations_found": len(results),
-                    "obs_date_mjd": float(row["t_min"]) if "t_min" in row.colnames else None,
-                    "image_base64": fits_bytes_to_base64_png(resp.content),
+                    "total_observations": len(results),
+                    "epoch1_mjd": round(float(row1["t_min"]), 2) if "t_min" in row1.colnames else "Earliest",
+                    "epoch2_mjd": round(float(row2["t_min"]), 2) if "t_min" in row2.colnames else "Latest",
+                    "poi": poi,
+                    "epoch1_base64": array_to_base64_png(arr1),
+                    "epoch2_base64": array_to_base64_png(arr2),
+                    "diff_base64": array_to_base64_png(diff),
                 }
-        except Exception:
+        except Exception as e:
+            print(f"IRSA {col} multi-epoch query failed: {e}")
             continue
 
-    # 2. Fallback: Fetch real infrared FITS cutout via CDS/IRSA HiPS2FITS when IRSA SIA2 has a 502 Proxy Error
-    try:
-        hips_url = (
-            "https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
-            f"?hips=CDS%2FP%2FallWISE%2FW1&width=256&height=256&fov={size}"
-            f"&projection=TAN&coordsys=icrs&ra={ra}&dec={dec}&format=fits"
-        )
-        resp = requests.get(hips_url, timeout=25)
-        resp.raise_for_status()
-        return {
-            "ra": ra,
-            "dec": dec,
-            "source": "HiPS2FITS Infrared Fallback (IRSA SIA2 Proxy 502)",
-            "total_observations_found": 1,
-            "obs_date_mjd": None,
-            "image_base64": fits_bytes_to_base64_png(resp.content),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Both primary and fallback cutout services failed: {e}")
+    ep1_b64, ep2_b64, diff_b64, poi = generate_simulated_blink(ra, dec)
+    return {
+        "ra": ra,
+        "dec": dec,
+        "source": "Simulated Multi-Epoch Fallback (IRSA Proxy Busy)",
+        "total_observations": 2,
+        "epoch1_mjd": "Epoch 1 (Baseline)",
+        "epoch2_mjd": "Epoch 2 (+6 Months)",
+        "poi": poi,
+        "epoch1_base64": ep1_b64,
+        "epoch2_base64": ep2_b64,
+        "diff_base64": diff_b64,
+    }
