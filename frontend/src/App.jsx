@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import "./styles.css";
 
+const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+
 const BENCHMARK_TARGETS = [
   {
     name: "Barnard's Star",
@@ -350,9 +352,7 @@ function Discover360Page({ onInspectInViewer }) {
     setPitch(0);
     setActiveLandmarkId(sector.landmarks[0].id);
 
-    fetch(
-      `http://127.0.0.1:8000/api/blink?ra=${sector.centerRa}&dec=${sector.centerDec}&size=0.08`,
-      { signal: controller.signal }
+    fetch(`${API_BASE}/api/blink?ra=${sector.centerRa}&dec=${sector.centerDec}&size=0.08`, { signal: controller.signal }
     )
       .then((res) => res.json())
       .then((json) => {
@@ -1270,9 +1270,7 @@ export default function App() {
     setCustomRa(selected.ra);
     setCustomDec(selected.dec);
 
-    fetch(
-      `http://127.0.0.1:8000/api/blink?ra=${selected.ra}&dec=${selected.dec}&size=${fov}`,
-      { signal: controller.signal }
+    fetch(`${API_BASE}/api/blink?ra=${selected.ra}&dec=${selected.dec}&size=${fov}`, { signal: controller.signal }
     )
       .then((res) => res.json())
       .then((json) => {
